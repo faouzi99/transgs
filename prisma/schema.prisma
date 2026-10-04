@@ -1,0 +1,277 @@
+// TRANSWIN data model.
+// Append-only rule: business rows (operations, stock movements, inventories) are never
+// updated in place nor deleted. A correction is a new row pointing to the row it replaces
+// through `correctionOfId`; the "current" version of a record is the one nobody corrects.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  AGENT
+  CHEF_SITE
+  DIRECTION
+}
+
+enum Famille {
+  D
+  E
+}
+
+enum UniteCompteur {
+  KM
+  H
+}
+
+enum OperationType {
+  VIDANGE
+  REPARATION
+  SOUFFLAGE
+  GRAISSAGE
+  LAVAGE
+}
+
+enum Unite {
+  L
+  KG
+}
+
+enum Sens {
+  ENTREE
+  SORTIE
+}
+
+enum ReportKind {
+  OPERATION
+  SUIVI
+  CONSOMMATION
+}
+
+enum ReportPeriod {
+  JOUR
+  MOIS
+  ANNEE
+}
+
+model User {
+  id          String   @id @default(cuid())
+  nom         String
+  email       String   @unique
+  hash        String
+  role        Role
+  siteId      String?
+  site        Site?    @relation(fields: [siteId], references: [id])
+  actif       Boolean  @default(true)
+  createdById String?
+  createdBy   User?    @relation("UserCreatedBy", fields: [createdById], references: [id])
+  createdAt   DateTime @default(now())
+
+  created         User[]          @relation("UserCreatedBy")
+  sessions        Session[]
+  operations      Operation[]     @relation("OperationAgent")
+  validations     Operation[]     @relation("OperationValidator")
+  stockMovements  StockMovement[]
+  inventories     Inventory[]
+  reports         Report[]
+  auditLogs       AuditLog[]
+}
+
+model Session {
+  id        String   @id // sha256 of the cookie token
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+model Site {
+  id          String  @id @default(cuid())
+  nom         String  @unique
+  responsable String?
+
+  users          User[]
+  equipments     Equipment[]
+  operations     Operation[]
+  stockMovements StockMovement[]
+  inventories    Inventory[]
+  reports        Report[]
+}
+
+model Equipment {
+  codeParking       String        @id
+  famille           Famille
+  marque            String
+  type              String
+  immatriculation   String?
+  annee             Int?
+  siteId            String
+  site              Site          @relation(fields: [siteId], references: [id])
+  compteurActuel    Int           @default(0)
+  uniteCompteur     UniteCompteur
+  // Counter value at which the next oil change is due (recomputed on each VIDANGE).
+  prochaineEcheance Int?
+  actif             Boolean       @default(true)
+  createdAt         DateTime      @default(now())
+
+  operations     Operation[]
+  stockMovements StockMovement[]
+
+  @@index([siteId])
+}
+
+model Operation {
+  id          String        @id @default(cuid())
+  codeParking String
+  equipment   Equipment     @relation(fields: [codeParking], references: [codeParking])
+  type        OperationType
+  date        DateTime
+  agentId     String
+  agent       User          @relation("OperationAgent", fields: [agentId], references: [id])
+  siteId      String
+  site        Site          @relation(fields: [siteId], references: [id])
+  compteur    Int
+  observation String?
+  // Total cost in MAD (parts + labour for repairs). Lubricant cost is derived from stock movements.
+  cout        Decimal?      @db.Decimal(12, 2)
+  valideeParId String?
+  valideePar  User?         @relation("OperationValidator", fields: [valideeParId], references: [id])
+  valideeLe   DateTime?
+
+  // VIDANGE
+  produitId         String?
+  produit           Lubricant? @relation(fields: [produitId], references: [id])
+  quantite          Decimal?   @db.Decimal(10, 2)
+  filtreChange      Boolean?
+  prochaineEcheance Int?
+
+  // REPARATION
+  panne                    String?
+  pieces                   String?
+  fournisseur              String?
+  dureeImmobilisationJours Int?
+  coutPieces               Decimal? @db.Decimal(12, 2)
+  coutMainOeuvre           Decimal? @db.Decimal(12, 2)
+
+  // Correction chain
+  correctionOfId String?     @unique
+  correctionOf   Operation?  @relation("OperationCorrection", fields: [correctionOfId], references: [id])
+  correctedBy    Operation?  @relation("OperationCorrection")
+  motifCorrection String?
+
+  createdAt      DateTime        @default(now())
+  stockMovements StockMovement[]
+
+  @@index([siteId, date])
+  @@index([codeParking, date])
+  @@index([type, date])
+}
+
+model Lubricant {
+  id           String  @id @default(cuid())
+  nom          String  @unique
+  unite        Unite
+  seuilAlerte  Decimal @db.Decimal(10, 2)
+  // Unit price in MAD, used for lubricant cost per equipment.
+  prixUnitaire Decimal @default(0) @db.Decimal(10, 2)
+  ordre        Int     @default(0)
+
+  operations     Operation[]
+  stockMovements StockMovement[]
+  inventories    Inventory[]
+}
+
+model StockMovement {
+  id          String     @id @default(cuid())
+  produitId   String
+  produit     Lubricant  @relation(fields: [produitId], references: [id])
+  sens        Sens
+  quantite    Decimal    @db.Decimal(10, 2)
+  siteId      String
+  site        Site       @relation(fields: [siteId], references: [id])
+  codeParking String?
+  equipment   Equipment? @relation(fields: [codeParking], references: [codeParking])
+  fournisseur String?
+  bonLivraison String?
+  operationId String?
+  operation   Operation? @relation(fields: [operationId], references: [id])
+  date        DateTime
+  agentId     String
+  agent       User       @relation(fields: [agentId], references: [id])
+
+  correctionOfId  String?        @unique
+  correctionOf    StockMovement? @relation("MovementCorrection", fields: [correctionOfId], references: [id])
+  correctedBy     StockMovement? @relation("MovementCorrection")
+  motifCorrection String?
+
+  createdAt DateTime @default(now())
+
+  @@index([siteId, produitId, date])
+  @@index([codeParking, date])
+  @@index([operationId])
+}
+
+model Inventory {
+  id                String    @id @default(cuid())
+  siteId            String
+  site              Site      @relation(fields: [siteId], references: [id])
+  produitId         String
+  produit           Lubricant @relation(fields: [produitId], references: [id])
+  // First day of the month (local time), e.g. 2026-09-01.
+  mois              DateTime  @db.Date
+  quantitePhysique  Decimal   @db.Decimal(10, 2)
+  quantiteTheorique Decimal   @db.Decimal(10, 2)
+  ecart             Decimal   @db.Decimal(10, 2)
+  justification     String?
+  agentId           String
+  agent             User      @relation(fields: [agentId], references: [id])
+  createdAt         DateTime  @default(now())
+
+  @@index([siteId, produitId, mois])
+}
+
+model Setting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+model Report {
+  id            String         @id @default(cuid())
+  kind          ReportKind
+  operationType OperationType?
+  period        ReportPeriod
+  dateDebut     DateTime
+  dateFin       DateTime
+  siteId        String?
+  site          Site?          @relation(fields: [siteId], references: [id])
+  titre         String
+  pdf           Bytes
+  xlsx          Bytes?
+  authorId      String
+  author        User           @relation(fields: [authorId], references: [id])
+  createdAt     DateTime       @default(now())
+
+  @@index([createdAt])
+}
+
+// Signed, timestamped trail of reference-data changes made by administrators.
+model AuditLog {
+  id       String   @id @default(cuid())
+  userId   String
+  user     User     @relation(fields: [userId], references: [id])
+  action   String
+  entity   String
+  entityId String
+  data     Json?
+  at       DateTime @default(now())
+
+  @@index([entity, entityId])
+}
